@@ -16,7 +16,7 @@ export default function EmpresasPage() {
     setLoading(true);
     const { data } = await supabase
       .from("companies")
-      .select("id, name, nif_cif, portal_user_id, active")
+      .select("id, name, nif_cif, email, fiscal_address, phone, portal_user_id, active")
       .order("name");
     setCompanies(data || []);
     setLoading(false);
@@ -284,6 +284,13 @@ function CompanyModal({ company, profileId, onClose, onSaved }) {
       const { data: sessionData } = await supabase.auth.getSession();
       await supabase.functions.invoke("admin-actions", {
         body: { type: "invite_company", company_id: companyId, email: form.email },
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+    } else if (company.portal_user_id && form.email !== company.email) {
+      // El portal de esta empresa ya estaba activo con otro email: sincronizamos el login
+      const { data: sessionData } = await supabase.auth.getSession();
+      await supabase.functions.invoke("admin-actions", {
+        body: { type: "update_email", target: "company", id: company.portal_user_id, new_email: form.email },
         headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
       });
     }

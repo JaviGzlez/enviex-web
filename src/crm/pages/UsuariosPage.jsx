@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { KeyRound, Plus, Trash2, X } from "lucide-react";
+import { KeyRound, Pencil, Plus, Trash2, X } from "lucide-react";
 import { supabase } from "../supabaseClient.js";
 import { useAuth } from "../AuthContext.jsx";
 
@@ -7,6 +7,7 @@ export default function UsuariosPage() {
   const { user } = useAuth();
   const [users, setUsers] = useState([]);
   const [showForm, setShowForm] = useState(false);
+  const [editingUser, setEditingUser] = useState(null);
   const [notice, setNotice] = useState("");
 
   const loadUsers = () => {
@@ -81,6 +82,9 @@ export default function UsuariosPage() {
             <div className="capitalize">{u.role}</div>
             <div>{u.active ? "Activo" : "Inactivo"}</div>
             <div className="flex items-center gap-2">
+              <button onClick={() => setEditingUser(u)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100" title="Editar nombre o email">
+                <Pencil size={15} />
+              </button>
               <button onClick={() => sendPasswordReset(u)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100" title="Enviar recuperación de contraseña">
                 <KeyRound size={15} />
               </button>
@@ -97,6 +101,18 @@ export default function UsuariosPage() {
           onClose={() => setShowForm(false)}
           onCreated={(message) => {
             setShowForm(false);
+            setNotice(message);
+            loadUsers();
+          }}
+        />
+      )}
+
+      {editingUser && (
+        <EditUserModal
+          user={editingUser}
+          onClose={() => setEditingUser(null)}
+          onSaved={(message) => {
+            setEditingUser(null);
             setNotice(message);
             loadUsers();
           }}
@@ -154,6 +170,72 @@ function NewUserModal({ onClose, onCreated }) {
 
           <button type="submit" disabled={saving} className="w-full rounded-xl bg-[#e50914] px-4 py-3 text-sm font-black text-white disabled:opacity-60">
             {saving ? "Enviando invitación..." : "Crear e invitar"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function EditUserModal({ user, onClose, onSaved }) {
+  const [fullName, setFullName] = useState(user.full_name || "");
+  const [email, setEmail] = useState(user.email || "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setError("");
+
+    // El nombre se puede cambiar directamente
+    if (fullName !== user.full_name) {
+      const { error: nameError } = await supabase.from("profiles").update({ full_name: fullName }).eq("id", user.id);
+      if (nameError) {
+        setError("No se pudo guardar el nombre.");
+        setSaving(false);
+        return;
+      }
+    }
+
+    // El email hay que cambiarlo también en el login, así que pasa por la función de servidor
+    if (email !== user.email) {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const { data, error: fnError } = await supabase.functions.invoke("admin-actions", {
+        body: { type: "update_email", target: "staff", id: user.id, new_email: email },
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+      if (fnError || data?.error) {
+        setError(data?.error || "No se pudo actualizar el email.");
+        setSaving(false);
+        return;
+      }
+    }
+
+    setSaving(false);
+    onSaved(`${fullName} actualizado correctamente.`);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-3xl bg-white p-6" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-black text-[#092640]">Editar usuario</h2>
+          <button onClick={onClose} className="rounded-full bg-slate-100 p-2"><X size={16} /></button>
+        </div>
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <input required placeholder="Nombre completo" value={fullName} onChange={(e) => setFullName(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
+          <input required type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
+          {email !== user.email && (
+            <p className="text-xs text-amber-600">
+              Al cambiar el email, la próxima vez que {fullName.split(" ")[0]} entre tendrá que usar el email nuevo para iniciar sesión.
+            </p>
+          )}
+
+          {error && <p className="text-sm font-medium text-[#e50914]">{error}</p>}
+
+          <button type="submit" disabled={saving} className="w-full rounded-xl bg-[#092640] px-4 py-3 text-sm font-black text-white disabled:opacity-60">
+            {saving ? "Guardando..." : "Guardar cambios"}
           </button>
         </form>
       </div>

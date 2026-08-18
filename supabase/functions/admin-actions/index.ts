@@ -121,6 +121,31 @@ const { data: invited, error: inviteError } = await adminClient.auth.admin.invit
       return json({ ok: true });
     }
 
+    if (body.type === "update_email") {
+      const { target, id, new_email } = body;
+      if (!target || !id || !new_email) return json({ error: "Datos incompletos" }, 400);
+
+      if (target === "staff") {
+        const { error: authError } = await adminClient.auth.admin.updateUserById(id, { email: new_email });
+        if (authError) return json({ error: authError.message }, 400);
+
+        const { error: profileError } = await adminClient.from("profiles").update({ email: new_email }).eq("id", id);
+        if (profileError) return json({ error: profileError.message }, 400);
+
+        return json({ ok: true });
+      }
+
+      if (target === "company") {
+        // "id" aquí es el portal_user_id (el login de esa empresa en el portal)
+        const { error: authError } = await adminClient.auth.admin.updateUserById(id, { email: new_email });
+        if (authError) return json({ error: authError.message }, 400);
+
+        return json({ ok: true });
+      }
+
+      return json({ error: "Objetivo desconocido" }, 400);
+    }
+
     return json({ error: "Tipo de acción desconocido" }, 400);
   } catch (err) {
     return json({ error: String(err) }, 500);

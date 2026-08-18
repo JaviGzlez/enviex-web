@@ -1,39 +1,4 @@
 // Edge Function: generate-monthly-invoices
-// Pensada para ejecutarse automáticamente el día 1 de cada mes (vía Cron Job de Supabase).
-// También se puede llamar a mano para probar — es segura de repetir: una empresa ya
-// facturada no vuelve a facturarse (sus envíos ya no tienen invoice_id = null).
-
-import { createClient } from "npm:@supabase/supabase-js@2";
-import { PDFDocument, rgb, StandardFonts } from "npm:pdf-lib@1.17.1";
-import qrcodegen from "npm:qrcode-generator@1.4.4";
-
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SERVICE_ROLE_KEY = getServiceRoleKey();
-const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
-
-function getServiceRoleKey() {
-  const legacy = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (legacy) return legacy;
-  const dict = Deno.env.get("SUPABASE_SECRET_KEYS");
-  if (dict) {
-    try {
-      const parsed = JSON.parse(dict);
-      return parsed.default || Object.values(parsed)[0];
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-const EMISOR = {
-  nombre: "José Carlos Ortiz Cervera (Enviex)",
-  nif: "32056045W",
-  direccion: "Calle Higueras, 3, 11402 Jerez de la Frontera, Cádiz",
-  email: "operativa@enviex.es",
-};
-const IVA_RATE = 0.21;
-
-// Edge Function: generate-monthly-invoices
 // Dos modos de uso:
 //  1) Automático: se llama sin datos (o {}) desde el Cron Job el día 1 de cada mes,
 //     y factura a TODAS las empresas activas sus envíos pendientes.
