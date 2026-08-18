@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Pencil, Plus, Power, Search, Trash2, X } from "lucide-react";
+import { Pencil, Plus, Power, Search, Send, Trash2, X } from "lucide-react";
 import { supabase } from "../supabaseClient.js";
 import { useAuth } from "../AuthContext.jsx";
 
@@ -35,6 +35,32 @@ export default function EmpresasPage() {
     if (!window.confirm(confirmMsg)) return;
     await supabase.from("companies").update({ active: !company.active }).eq("id", company.id);
     loadCompanies();
+  };
+
+  const resendAccess = async (company) => {
+    if (company.portal_user_id) {
+      // Ya existe la cuenta (pendiente de confirmar): mandamos un enlace para poner contraseña
+      const { error } = await supabase.auth.resetPasswordForEmail(company.email, {
+        redirectTo: "https://www.enviex.es/crm/login",
+      });
+      if (error) {
+        setNotice(`No se pudo reenviar: ${error.message}`);
+        return;
+      }
+    } else {
+      // Todavía no se creó la cuenta: la creamos e invitamos por primera vez
+      const { data: sessionData } = await supabase.auth.getSession();
+      const { data, error } = await supabase.functions.invoke("admin-actions", {
+        body: { type: "invite_company", company_id: company.id, email: company.email },
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+      if (error || data?.error) {
+        setNotice(data?.error || "No se pudo enviar la invitación.");
+        return;
+      }
+      loadCompanies();
+    }
+    setNotice(`Acceso reenviado a ${company.email}.`);
   };
 
   const deleteCompany = async (company) => {
@@ -103,6 +129,11 @@ export default function EmpresasPage() {
               <button onClick={() => setModalCompany(c)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100" title="Editar">
                 <Pencil size={15} />
               </button>
+              {c.active && !c.portal_user_id && (
+                <button onClick={() => resendAccess(c)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100" title="Reenviar acceso al portal">
+                  <Send size={15} />
+                </button>
+              )}
               <button onClick={() => toggleActive(c)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100" title={c.active ? "Desactivar" : "Reactivar"}>
                 <Power size={15} />
               </button>
