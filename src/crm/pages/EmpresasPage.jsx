@@ -144,6 +144,7 @@ export default function EmpresasPage() {
 function CompanyDetailModal({ company, onClose }) {
   const [rates, setRates] = useState([]);
   const [invoices, setInvoices] = useState([]);
+  const [pending, setPending] = useState([]);
 
   useEffect(() => {
     supabase.from("company_rates").select("service_type, price").eq("company_id", company.id)
@@ -151,7 +152,11 @@ function CompanyDetailModal({ company, onClose }) {
     supabase.from("invoices").select("id, series, number, period_start, period_end, total, status")
       .eq("company_id", company.id).order("issued_at", { ascending: false })
       .then(({ data }) => setInvoices(data || []));
+    supabase.from("shipments").select("price").eq("company_id", company.id).is("invoice_id", null)
+      .then(({ data }) => setPending(data || []));
   }, [company.id]);
+
+  const pendingTotal = pending.reduce((sum, s) => sum + Number(s.price), 0);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
@@ -159,6 +164,11 @@ function CompanyDetailModal({ company, onClose }) {
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-black text-[#092640]">{company.name}</h2>
           <button onClick={onClose} className="rounded-full bg-slate-100 p-2"><X size={16} /></button>
+        </div>
+
+        <div className="mb-5 flex items-center justify-between rounded-xl bg-[#092640] px-4 py-3 text-white">
+          <span className="text-sm font-bold">Acumulado sin facturar ({pending.length} envíos)</span>
+          <span className="text-lg font-black">{pendingTotal.toFixed(2)} €</span>
         </div>
 
         <h3 className="mb-2 text-xs font-bold uppercase text-slate-400">Tarifa actual</h3>

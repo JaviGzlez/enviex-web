@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from "react";
-import { Trash2 } from "lucide-react";
+import { FileCheck2, Trash2 } from "lucide-react";
 import { supabase } from "../supabaseClient.js";
 import { useAuth } from "../AuthContext.jsx";
 import CompanySearchSelect from "../components/CompanySearchSelect.jsx";
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
 
 export default function FacturasPage() {
   const { role } = useAuth();
@@ -12,6 +14,11 @@ export default function FacturasPage() {
   const [filterCompanyId, setFilterCompanyId] = useState("");
   const [pendingShipments, setPendingShipments] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [cutoffDate, setCutoffDate] = useState(todayISO());
+  const [generating, setGenerating] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [sequence, setSequence] = useState(null);
+  const [editingSeq, setEditingSeq] = useState(false);
 
   const loadInvoices = () => {
     supabase
@@ -34,7 +41,7 @@ export default function FacturasPage() {
       .then(({ data }) => setCompanies(data || []));
   }, []);
 
-  useEffect(() => {
+  const loadPending = () => {
     if (!pendingCompanyId) {
       setPendingShipments([]);
       return;
@@ -46,10 +53,60 @@ export default function FacturasPage() {
       .is("invoice_id", null)
       .order("shipment_date")
       .then(({ data }) => setPendingShipments(data || []));
+  };
+
+  useEffect(() => {
+    loadPending();
+    setNotice("");
+    if (!pendingCompanyId) {
+      setSequence(null);
+      return;
+    }
+    supabase
+      .from("invoice_sequences_v2")
+      .select("series, next_number")
+      .eq("company_id", pendingCompanyId)
+      .maybeSingle()
+      .then(({ data }) => setSequence(data || { series: "A", next_number: 1 }));
   }, [pendingCompanyId]);
 
   const pendingTotal = pendingShipments.reduce((sum, s) => sum + Number(s.price), 0);
   const visibleInvoices = filterCompanyId ? invoices.filter((inv) => inv.company_id === filterCompanyId) : invoices;
+
+  const generateNow = async () => {
+    setGenerating(true);
+    setNotice("");
+    const { data: sessionData } = await supabase.auth.getSession();
+    const { data, error } = await supabase.functions.invoke("generate-monthly-invoices", {
+      body: { company_id: pendingCompanyId, period_end: cutoffDate },
+      headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+    });
+    setGenerating(false);
+
+    if (error || data?.error) {
+      setNotice("No se pudo generar la factura: " + (data?.error || error?.message));
+      return;
+    }
+    if (!data?.generated?.length) {
+      setNotice("No había envíos pendientes de facturar para esa fecha.");
+      return;
+    }
+    setNotice(`Factura ${data.generated[0].number} generada y enviada por ${data.generated[0].total} €.`);
+    loadPending();
+    loadInvoices();
+  };
+
+  const saveSequence = async () => {
+    const { error } = await supabase
+      .from("invoice_sequences_v2")
+      .upsert({ company_id: pendingCompanyId, series: sequence.series, next_number: Number(sequence.next_number) });
+    if (error) {
+      setNotice("No se pudo guardar la numeración: " + error.message);
+      return;
+    }
+    setEditingSeq(false);
+    setNotice("Numeración actualizada.");
+  };
 
   const handleDelete = async (inv) => {
     const sure = window.confirm(
@@ -94,6 +151,56 @@ export default function FacturasPage() {
             <div className="mt-3 text-right text-sm font-black text-[#092640]">
               Total acumulado: {pendingTotal.toFixed(2)} €
             </div>
+
+            {role === "admin" && sequence && (
+              <div className="mt-4 flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3 text-sm">
+                {editingSeq ? (
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-500">Serie</span>
+                    <input
+                      value={sequence.series}
+                      onChange={(e) => setSequence({ ...sequence, series: e.target.value })}
+                      className="w-14 rounded-lg border border-slate-200 px-2 py-1 text-center"
+                    />
+                    <span className="text-slate-500">Próximo número</span>
+                    <input
+                      type="number"
+                      value={sequence.next_number}
+                      onChange={(e) => setSequence({ ...sequence, next_number: e.target.value })}
+                      className="w-24 rounded-lg border border-slate-200 px-2 py-1"
+                    />
+                    <button onClick={saveSequence} className="rounded-lg bg-[#092640] px-3 py-1.5 font-bold text-white">Guardar</button>
+                    <button onClick={() => setEditingSeq(false)} className="text-slate-400">Cancelar</button>
+                  </div>
+                ) : (
+                  <>
+                    <span className="text-slate-500">
+                      Próxima factura de esta empresa será: <strong className="text-[#092640]">{sequence.series}-{String(sequence.next_number).padStart(5, "0")}</strong>
+                    </span>
+                    <button onClick={() => setEditingSeq(true)} className="text-xs font-bold text-[#092640] underline">Editar numeración</button>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="mt-4 flex items-center gap-3 border-t border-slate-100 pt-4">
+              <label className="text-xs font-bold text-slate-400">Facturar hasta:</label>
+              <input
+                type="date"
+                value={cutoffDate}
+                onChange={(e) => setCutoffDate(e.target.value)}
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm"
+              />
+              <button
+                onClick={generateNow}
+                disabled={generating || pendingShipments.length === 0}
+                className="flex items-center gap-2 rounded-xl bg-[#e50914] px-4 py-2 text-sm font-black text-white disabled:opacity-50"
+              >
+                <FileCheck2 size={16} /> {generating ? "Generando..." : "Generar factura ahora"}
+              </button>
+            </div>
+
+            {notice && <p className="mt-3 text-sm font-medium text-green-700">{notice}</p>}
           </>
         ) : (
           <p className="text-sm text-slate-400">Busca una empresa para ver lo que lleva acumulado este periodo, antes de que se facture.</p>

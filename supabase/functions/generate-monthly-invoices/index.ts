@@ -33,20 +33,106 @@ const EMISOR = {
 };
 const IVA_RATE = 0.21;
 
-Deno.serve(async (_req) => {
+// Edge Function: generate-monthly-invoices
+// Dos modos de uso:
+//  1) Automático: se llama sin datos (o {}) desde el Cron Job el día 1 de cada mes,
+//     y factura a TODAS las empresas activas sus envíos pendientes.
+//  2) Bajo demanda: se llama con { company_id, period_end } (period_end opcional,
+//     por defecto hoy) para facturar YA a una sola empresa, cuando tú quieras.
+// Es segura de repetir: un envío ya facturado no se vuelve a facturar.
+
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { PDFDocument, rgb, StandardFonts } from "npm:pdf-lib@1.17.1";
+import qrcodegen from "npm:qrcode-generator@1.4.4";
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SERVICE_ROLE_KEY = getServiceRoleKey();
+const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
+
+function getServiceRoleKey() {
+  const legacy = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (legacy) return legacy;
+  const dict = Deno.env.get("SUPABASE_SECRET_KEYS");
+  if (dict) {
+    try {
+      const parsed = JSON.parse(dict);
+      return parsed.default || Object.values(parsed)[0];
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+const EMISOR = {
+  nombre: "José Carlos Ortiz Cervera (Enviex)",
+  nif: "32056045W",
+  direccion: "Calle Higueras, 3, 11402 Jerez de la Frontera, Cádiz",
+  email: "operativa@enviex.es",
+};
+const IVA_RATE = 0.21;
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-  // Periodo: el mes natural anterior a hoy
-  const now = new Date();
-  const periodStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  const periodEnd = new Date(now.getFullYear(), now.getMonth(), 0);
-  const periodStartStr = toISODate(periodStart);
-  const periodEndStr = toISODate(periodEnd);
+  let body = {};
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
 
-  const { data: companies } = await supabase
+  const onDemand = Boolean(body.company_id);
+
+  if (onDemand) {
+    const authHeader = req.headers.get("Authorization") || "";
+    const callerToken = authHeader.replace("Bearer ", "");
+    const { data: callerUser } = await supabase.auth.getUser(callerToken);
+    if (!callerUser?.user) {
+      return new Response(JSON.stringify({ error: "No autenticado" }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    const { data: callerProfile } = await supabase
+      .from("profiles")
+      .select("role, active")
+      .eq("id", callerUser.user.id)
+      .maybeSingle();
+    if (!callerProfile || !callerProfile.active || !["admin", "gestor"].includes(callerProfile.role)) {
+      return new Response(JSON.stringify({ error: "No autorizado" }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+  }
+
+  const now = new Date();
+
+  // Modo automático mensual: factura todo hasta el último día del mes anterior.
+  // Modo bajo demanda: factura hasta hoy (o la fecha que se indique).
+  const periodEndStr = onDemand
+    ? (body.period_end || toISODate(now))
+    : toISODate(new Date(now.getFullYear(), now.getMonth(), 0));
+
+  let companiesQuery = supabase
     .from("companies")
     .select("id, name, nif_cif, fiscal_address, email")
     .eq("active", true);
+
+  if (onDemand) {
+    companiesQuery = companiesQuery.eq("id", body.company_id);
+  }
+
+  const { data: companies } = await companiesQuery;
 
   const results = [];
 
@@ -60,45 +146,49 @@ Deno.serve(async (_req) => {
 
     if (!shipments || shipments.length === 0) continue;
 
+    const periodStartStr = shipments.map((s) => s.shipment_date).sort()[0];
+
     const subtotal = round2(shipments.reduce((sum, s) => sum + Number(s.price), 0));
     const ivaAmount = round2(subtotal * IVA_RATE);
     const total = round2(subtotal + ivaAmount);
 
-    // Numeración correlativa segura (evita huecos y repeticiones).
-    // Esta función se ejecuta una sola vez al mes de forma programada, así que
-    // no hay riesgo de que dos procesos pidan número a la vez.
+    // Numeración correlativa propia de esta empresa (evita huecos y repeticiones).
     const { data: seq } = await supabase
-      .from("invoice_sequences")
-      .select("next_number")
-      .eq("series", "A")
+      .from("invoice_sequences_v2")
+      .select("series, next_number")
+      .eq("company_id", company.id)
       .maybeSingle();
 
+    const series = seq?.series || "A";
     const currentNumber = seq?.next_number ?? 1;
-    await supabase.from("invoice_sequences").update({ next_number: currentNumber + 1 }).eq("series", "A");
+    await supabase
+      .from("invoice_sequences_v2")
+      .upsert({ company_id: company.id, series, next_number: currentNumber + 1 });
     const number = `${now.getFullYear()}-${String(currentNumber).padStart(5, "0")}`;
 
-    // Hash encadenado con la última factura emitida (de cualquier empresa)
+    // Hash encadenado con la última factura emitida A ESTA MISMA EMPRESA
     const { data: lastInvoice } = await supabase
       .from("invoices")
       .select("hash")
+      .eq("company_id", company.id)
       .order("issued_at", { ascending: false })
       .limit(1)
       .maybeSingle();
     const previousHash = lastInvoice?.hash || "GENESIS";
 
     const issuedAt = toISODate(now);
-    const hashInput = `${EMISOR.nif}|A-${number}|${issuedAt}|${total}|${previousHash}`;
+    const hashInput = `${EMISOR.nif}|${series}-${number}|${issuedAt}|${total}|${previousHash}`;
     const hash = await sha256Hex(hashInput);
 
-    const qrData = `NIF:${EMISOR.nif};NUM:A-${number};FECHA:${issuedAt};TOTAL:${total};HASH:${hash.slice(0, 16)}`;
+    const qrData = `NIF:${EMISOR.nif};NUM:${series}-${number};FECHA:${issuedAt};TOTAL:${total};HASH:${hash.slice(0, 16)}`;
 
     const pdfBytes = await buildInvoicePdf({
-      number, issuedAt, periodStartStr, periodEndStr,
+      series, number, issuedAt, periodStartStr, periodEndStr,
       company, shipments, subtotal, ivaAmount, total,
       hash, previousHash, qrData,
     });
 
-    const path = `${company.id}/A-${number}.pdf`;
+    const path = `${company.id}/${series}-${number}.pdf`;
     await supabase.storage.from("invoices").upload(path, pdfBytes, {
       contentType: "application/pdf",
       upsert: true,
@@ -107,7 +197,7 @@ Deno.serve(async (_req) => {
     const { data: invoice } = await supabase
       .from("invoices")
       .insert({
-        series: "A",
+        series,
         number,
         company_id: company.id,
         period_start: periodStartStr,
@@ -136,20 +226,20 @@ Deno.serve(async (_req) => {
       event_type: "invoice_issued",
       entity_type: "invoice",
       entity_id: invoice.id,
-      details: { company: company.name, total },
+      details: { company: company.name, total, on_demand: onDemand },
       hash,
       previous_hash: previousHash,
     });
 
     if (RESEND_API_KEY) {
-      await sendInvoiceEmail(company, number, total, pdfBytes);
+      await sendInvoiceEmail(company, series, number, total, pdfBytes);
     }
 
-    results.push({ company: company.name, number, total });
+    results.push({ company: company.name, number: `${series}-${number}`, total });
   }
 
   return new Response(JSON.stringify({ ok: true, generated: results }), {
-    headers: { "Content-Type": "application/json" },
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 });
 
@@ -176,7 +266,7 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-async function sendInvoiceEmail(company, number, total, pdfBytes) {
+async function sendInvoiceEmail(company, series, number, total, pdfBytes) {
   const base64 = bytesToBase64(pdfBytes);
   await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -187,14 +277,14 @@ async function sendInvoiceEmail(company, number, total, pdfBytes) {
     body: JSON.stringify({
       from: "Enviex <facturas@enviex.es>",
       to: company.email,
-      subject: `Factura Enviex A-${number}`,
-      html: `<p>Hola,</p><p>Adjuntamos la factura de vuestros envíos del mes pasado. Total: <strong>${total} €</strong>.</p><p>También puedes consultarla en tu portal de Enviex.</p>`,
-      attachments: [{ filename: `factura-A-${number}.pdf`, content: base64 }],
+      subject: `Factura Enviex ${series}-${number}`,
+      html: `<p>Hola,</p><p>Adjuntamos vuestra factura de Enviex. Total: <strong>${total} €</strong>.</p><p>También puedes consultarla en tu portal de Enviex.</p>`,
+      attachments: [{ filename: `factura-${series}-${number}.pdf`, content: base64 }],
     }),
   });
 }
 
-async function buildInvoicePdf({ number, issuedAt, periodStartStr, periodEndStr, company, shipments, subtotal, ivaAmount, total, hash, previousHash, qrData }) {
+async function buildInvoicePdf({ series, number, issuedAt, periodStartStr, periodEndStr, company, shipments, subtotal, ivaAmount, total, hash, previousHash, qrData }) {
   const doc = await PDFDocument.create();
   const page = doc.addPage([595.28, 841.89]); // A4
   const font = await doc.embedFont(StandardFonts.Helvetica);
@@ -222,7 +312,7 @@ async function buildInvoicePdf({ number, issuedAt, periodStartStr, periodEndStr,
   }
 
   page.drawText("FACTURA", { x: 460, y, size: 16, font: bold, color: NAVY });
-  page.drawText(`Nº A-${number}`, { x: 460, y: y - 16, size: 9.5, font, color: GRAY });
+  page.drawText(`Nº ${series}-${number}`, { x: 460, y: y - 16, size: 9.5, font, color: GRAY });
   page.drawText(`Fecha: ${issuedAt}`, { x: 460, y: y - 29, size: 9.5, font, color: GRAY });
   page.drawLine({ start: { x: 40, y: y - 40 }, end: { x: 555, y: y - 40 }, thickness: 1, color: NAVY });
 
